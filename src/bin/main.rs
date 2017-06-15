@@ -21,11 +21,13 @@ extern crate serde;
 #[macro_use] extern crate serde_json as sj;
 #[macro_use] extern crate serde_derive;
 
-use std::io::Write;
-use std::str;
-use std::fmt;
-use std::collections::HashMap;
 use serde::de::{SeqAccess, Visitor, Error};
+use std::collections::HashMap;
+use std::fmt;
+use std::io::Write;
+use std::net::IpAddr;
+use std::str;
+use std::cell::RefCell;
 
 #[derive(Serialize, Deserialize)]
 struct JsonRpcError {
@@ -193,7 +195,7 @@ fn deserialize_uuid<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 // Note regarding typing: This should be reasonably close to the actual OVSDB
 // schema.  So keep things as strings, even if they should eventually represent
 // e.g. IP addresses, or UUIDs (xxx check--this might actually be guaranteed),
-// unless OVSDB guarantees that a given field actually always contains a, say,
+// unless OVSDB guarantees that a given field actually always contains, say, an
 // IP and one can't smuggle in anything else.
 
 #[derive(Deserialize, Debug)]
@@ -250,7 +252,7 @@ struct JsonDiffVtepTunnel {
 }
 
 #[derive(Deserialize, Debug)]
-struct JsonDiff {
+struct JsonDiffVtep {
     #[serde(default, rename="Physical_Switch")]
     physical_switch: HashMap<String, JsonDiffVtepPhysicalSwitch>,
     #[serde(default, rename="Physical_Locator")]
@@ -259,6 +261,26 @@ struct JsonDiff {
     physical_locator_set: HashMap<String, JsonDiffVtepPhysicalLocatorSet>,
     #[serde(default, rename="Tunnel")]
     tunnel: HashMap<String, JsonDiffVtepTunnel>,
+}
+
+#[derive(Deserialize, Debug)]
+struct JsonOvsInterfacePart {
+    name: Option<String>,
+    #[serde(rename="type")]
+    typ: Option<String>,
+    ofport: Option<i32>,
+}
+
+#[derive(Deserialize, Debug)]
+struct JsonDiffOvsInterface {
+    old: Option<JsonOvsInterfacePart>,
+    new: Option<JsonOvsInterfacePart>,
+}
+
+#[derive(Deserialize, Debug)]
+struct JsonDiffOvs {
+    #[serde(default, rename="Interface")]
+    interface: HashMap<String, JsonDiffOvsInterface>,
 }
 
 fn jsonrpc_result(expect_id: u32, result: JsonRpcResult) -> Result<sj::Value, String> {
@@ -293,6 +315,78 @@ fn jsonrpc_communicate(stream: &mut unix_socket::UnixStream,
     return Result::Err("No JSON RPC response.".to_string());
 }
 
+// N.B.: These types model the actual VTEP domain, and thus the goal is to
+// create structures that are easy to work with and not necessarily ones that
+// copy OVSDB 1:1.  E.g. an IP address would be kept as IpAddr and not a String.
+
+struct PhysicalSwitch<'a> {
+    name: String,
+    //ports:
+    tunnel_ips: Vec<IpAddr>,
+
+    // This references tunnels owned by struct Tunnels.
+    tunnels: Vec<&'a RefCell<Tunnel>>,
+}
+
+struct Tunnel {
+}
+
+struct PhysicalSwitches<'a> {
+    switches: Vec<PhysicalSwitch<'a>>,
+}
+
+impl<'a> PhysicalSwitches<'a> {
+    fn new() -> PhysicalSwitches<'a> {
+        return PhysicalSwitches {
+            switches: Vec::new(),
+        };
+    }
+}
+
+struct PhysicalLocators {
+}
+
+struct PhysicalLocatorSets {
+}
+
+struct Tunnels {
+    tunnels: Vec<RefCell<Tunnel>>,
+}
+
+impl Tunnels {
+    fn new() -> Tunnels {
+        return Tunnels {
+            tunnels: Vec::new(),
+        };
+    }
+}
+
+struct Ovsdb<'a> {
+    physical_switches: PhysicalSwitches<'a>,
+    physical_locators: PhysicalLocators,
+    physical_locator_sets: PhysicalLocatorSets,
+    tunnels: Tunnels,
+}
+
+impl<'a> Ovsdb<'a> {
+    fn new() -> Ovsdb<'a> {
+        return Ovsdb {
+            physical_switches: PhysicalSwitches::new(),
+            physical_locators: PhysicalLocators {},
+            physical_locator_sets: PhysicalLocatorSets {},
+            tunnels: Tunnels::new(),
+        };
+    }
+
+    fn update_vtep(&mut self, diff: JsonDiffVtep) {
+    }
+
+    fn update_ovs(&mut self, diff: JsonDiffOvs) {
+    }
+}
+
+// -----------------------------------------------------------------------------
+
 fn main2() -> Result<(), String> {
     let mut stream = unix_socket::UnixStream::connect("/var/run/openvswitch/db.sock")
         .map_err(|err| format!("Couldn't open OVSDB socket: {}", err)) ?;
@@ -301,6 +395,8 @@ fn main2() -> Result<(), String> {
         let result = jsonrpc_communicate(&mut stream, "echo", json!(["Hello", "OVSDB", "?"])) ?;
         println!("{}", result);
     }
+
+    let mut ovsdb = Ovsdb::new();
 
     {
         let mon = json!(["hardware_vtep", "hardware_vtep",
@@ -319,9 +415,9 @@ fn main2() -> Result<(), String> {
                              }
                          }]);
         let result = jsonrpc_communicate(&mut stream, "monitor", mon) ?;
-        println!("{:?}\n---", result);
-        let d: JsonDiff = sj::from_value(result).unwrap();
-        println!("{:?}", d);
+        let d: JsonDiffVtep = sj::from_value(result).unwrap();
+        println!("hardware_vtep initial dump {:?}", d);
+        ovsdb.update_vtep(d);
     }
 
     {
@@ -332,17 +428,22 @@ fn main2() -> Result<(), String> {
                              },
                          }]);
         let result = jsonrpc_communicate(&mut stream, "monitor", mon) ?;
-        println!("{}", result);
+        let d: JsonDiffOvs = sj::from_value(result).unwrap();
+        println!("Open_vSwitch initial dump {:?}", d);
+        ovsdb.update_ovs(d);
     }
 
     for val in sj::Deserializer::from_reader(stream).into_iter::<JsonRpcMonitorEvent>() {
         let res = val.map_err(|err| format!("JSON RPC error: {}", err)) ?;
         if let sj::Value::String(ref dbname) = res.params.key {
             if dbname == "hardware_vtep" {
-                let d: JsonDiff = sj::from_value(res.params.updates).unwrap();
+                let d: JsonDiffVtep = sj::from_value(res.params.updates).unwrap();
                 println!("VTEP update: {:?}", d);
+                ovsdb.update_vtep(d);
             } else if dbname == "Open_vSwitch" {
-                println!("OVS update: {:?}", res.params.updates);
+                let d: JsonDiffOvs = sj::from_value(res.params.updates).unwrap();
+                println!("OVS update: {:?}", d);
+                ovsdb.update_ovs(d);
             } else {
                 return Err(format!("Monitor event relating to an unknown database {}", dbname));
             }
